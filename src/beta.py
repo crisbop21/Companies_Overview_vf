@@ -15,11 +15,15 @@ import math
 
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
 
 logger = logging.getLogger(__name__)
 
 BENCHMARKS = {"SPY", "QQQ"}
+
+
+def _norm_cdf(x: float) -> float:
+    """Standard normal CDF using math.erf (replaces scipy.stats.norm.cdf)."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 DEFAULT_LOOKBACK_DAYS = 252
 DEFAULT_MIN_PERIODS = 60
@@ -180,9 +184,9 @@ def compute_option_delta(
         ) / (sigma * math.sqrt(dte_years))
 
         if right == "C":
-            return float(math.exp(-dividend_yield * dte_years) * norm.cdf(d1))
+            return float(math.exp(-dividend_yield * dte_years) * _norm_cdf(d1))
         else:  # P
-            return float(math.exp(-dividend_yield * dte_years) * (norm.cdf(d1) - 1))
+            return float(math.exp(-dividend_yield * dte_years) * (_norm_cdf(d1) - 1))
     except (ValueError, ZeroDivisionError, OverflowError):
         return None
 
