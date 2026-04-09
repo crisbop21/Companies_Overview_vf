@@ -1,14 +1,8 @@
 streamlit==1.41.1
-pdfplumber==0.11.4
 pandas==2.2.3
-supabase==2.11.0
 pydantic==2.10.5
 python-dotenv==1.0.1
-cffi>=1.16.0
-cryptography>=42.0.0
 requests==2.32.3
 yfinance==1.2.0
 numpy==2.2.3
-anthropic==0.52.0
-fpdf2==2.8.7
 plotly==5.24.1
