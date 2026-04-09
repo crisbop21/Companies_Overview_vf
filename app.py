@@ -1,33 +1,20 @@
-import os
 import sys
 from pathlib import Path
 
-# Ensure the repo root is on sys.path so `import src` resolves to our package,
-# not the Streamlit Cloud mount directory (/mount/src/).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import streamlit as st
-try:
-    from dotenv import load_dotenv
-except ModuleNotFoundError:
-    # python-dotenv is not strictly required on Streamlit Cloud,
-    # where secrets are injected via the platform.
-    load_dotenv = None
 
 from src.logging_config import setup_logging
 
-_env_file = Path(__file__).resolve().parent / ".env"
-if _env_file.exists() and load_dotenv is not None:
-    load_dotenv(_env_file)
 setup_logging()
 
 st.set_page_config(
-    page_title="IBKR Trade Journal",
+    page_title="Companies Overview",
     page_icon="📊",
     layout="wide",
 )
 
-# Reduce default padding so content uses more of the screen
 st.markdown(
     """
     <style>
@@ -41,24 +28,39 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# --- Resolve secrets: prefer env vars, fall back to st.secrets ---
-for var in ("SUPABASE_URL", "SUPABASE_KEY", "ANTHROPIC_API_KEY"):
-    if not os.environ.get(var):
-        try:
-            os.environ[var] = st.secrets[var]
-        except (KeyError, FileNotFoundError):
-            pass
+st.title("Companies Overview")
+st.markdown("Enter ticker symbols to fetch SEC fundamentals, Yahoo Finance prices, and view visualizations.")
 
-REQUIRED_VARS = ("SUPABASE_URL", "SUPABASE_KEY")
-missing = [var for var in REQUIRED_VARS if not os.environ.get(var)]
-if missing:
-    st.error(
-        f"Missing required secrets: **{', '.join(missing)}**.\n\n"
-        "**Local:** set them in your `.env` file (see `.env.example`).\n\n"
-        "**Streamlit Cloud:** add them in App settings → Secrets as:\n"
-        "```\nSUPABASE_URL = \"your-url\"\nSUPABASE_KEY = \"your-key\"\n```"
-    )
-    st.stop()
+# ── Symbol input ────────────────────────────────────────────────────────────
 
-st.title("IBKR Trade Journal")
-st.markdown("Upload your Interactive Brokers statements and track your portfolio.")
+default_symbols = ", ".join(st.session_state.get("symbols", []))
+raw = st.text_input(
+    "Ticker symbols (comma-separated)",
+    value=default_symbols,
+    placeholder="e.g. AAPL, MSFT, GOOGL, AMZN, NVDA",
+)
+
+if st.button("Set Symbols", type="primary"):
+    symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
+    if symbols:
+        st.session_state["symbols"] = symbols
+        # Clear stale data when symbols change
+        for key in ("metrics_data", "price_data"):
+            st.session_state.pop(key, None)
+        st.success(f"Tracking {len(symbols)} symbols: {', '.join(symbols)}")
+    else:
+        st.warning("Enter at least one ticker symbol.")
+
+symbols = st.session_state.get("symbols", [])
+if symbols:
+    st.caption(f"Current symbols: **{', '.join(symbols)}**")
+
+    has_metrics = bool(st.session_state.get("metrics_data"))
+    has_prices = bool(st.session_state.get("price_data"))
+
+    st.markdown("---")
+    c1, c2 = st.columns(2)
+    c1.metric("SEC Metrics", f"{len(st.session_state.get('metrics_data', {}))} symbols" if has_metrics else "Not fetched")
+    c2.metric("Price Data", f"{len(st.session_state.get('price_data', {}))} symbols" if has_prices else "Not fetched")
+
+    st.info("Use the pages in the sidebar to fetch data and view visualizations.")

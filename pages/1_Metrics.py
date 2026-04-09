@@ -1,4 +1,4 @@
-"""Stock Metrics — fundamental data from SEC EDGAR for portfolio holdings."""
+"""Stock Metrics — fundamental data from SEC EDGAR."""
 
 import sys
 from pathlib import Path
@@ -7,19 +7,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.express as px
 import streamlit as st
 
-from src.db import (
-    clear_query_caches,
-    delete_stock_metrics,
-    get_account_ids,
-    get_latest_stock_metrics,
-    get_metrics_for_symbols,
-    get_portfolio_symbols,
-    get_stock_metrics,
-    upsert_stock_metrics,
-)
 from src.fetcher import fetch_metrics_for_symbol
 from src.splits import (
     SPLIT_AFFECTED_PER_SHARE,
@@ -34,32 +23,18 @@ from src.ui_helpers import COLORS, inject_metric_card_css
 st.title("Stock Metrics")
 inject_metric_card_css()
 
-# ── Account selector ─────────────────────────────────────────────────────────
+# ── Guard: need symbols ─────────────────────────────────────────────────────
 
-account_ids = get_account_ids()
-if not account_ids:
-    st.info("No statements uploaded yet.")
-    st.page_link("pages/1_Upload.py", label="Go to Upload", icon="📤")
-    st.stop()
-
-with st.sidebar:
-    account_options = ["All Accounts"] + account_ids
-    selected_account = st.selectbox("Account", account_options)
-    account_filter = None if selected_account == "All Accounts" else selected_account
-
-# ── Portfolio symbols ────────────────────────────────────────────────────────
-
-symbols = get_portfolio_symbols(account_id=account_filter)
+symbols = st.session_state.get("symbols", [])
 if not symbols:
-    st.info("No stock or ETF positions found.")
-    st.page_link("pages/1_Upload.py", label="Upload a statement with stock holdings", icon="📤")
+    st.info("No symbols configured. Go to the main page and enter ticker symbols.")
     st.stop()
 
-st.caption(f"{len(symbols)} stock/ETF symbols in portfolio")
+st.caption(f"{len(symbols)} symbols configured")
 
-# ── Fetch controls (collapsed when data exists) ─────────────────────────────
+# ── Fetch controls ──────────────────────────────────────────────────────────
 
-metrics_data = get_metrics_for_symbols(symbols)
+metrics_data: dict = st.session_state.get("metrics_data", {})
 has_data = bool(metrics_data)
 
 with st.expander("Fetch from SEC EDGAR", expanded=not has_data):
@@ -70,33 +45,13 @@ with st.expander("Fetch from SEC EDGAR", expanded=not has_data):
         help="Select which symbols to fetch fundamental data for. ETFs typically have no SEC filings.",
     )
 
-    overwrite = st.checkbox(
-        "Overwrite existing data",
-        value=False,
-        help=(
-            "Delete existing metrics for selected symbols before fetching. "
-            "Use this to re-fetch with updated reporting-style detection "
-            "(cumulative YTD vs standalone quarterly)."
-        ),
-    )
-
     col_fetch, col_status = st.columns([1, 3])
-
     with col_fetch:
         fetch_clicked = st.button("Fetch Metrics", type="primary", disabled=not fetch_symbols)
 
     if fetch_clicked:
         all_metrics = []
         all_errors = []
-
-        if overwrite and fetch_symbols:
-            with st.spinner("Deleting existing metrics..."):
-                deleted, del_errors = delete_stock_metrics(fetch_symbols)
-                all_errors.extend(del_errors)
-                if deleted:
-                    st.info(f"Deleted {deleted} existing metric rows for clean re-fetch.")
-                clear_query_caches()
-
         progress = st.progress(0, text="Starting...")
 
         for i, sym in enumerate(fetch_symbols):
@@ -104,21 +59,51 @@ with st.expander("Fetch from SEC EDGAR", expanded=not has_data):
                 (i + 1) / len(fetch_symbols),
                 text=f"Fetching {sym} ({i + 1}/{len(fetch_symbols)})...",
             )
-            metrics, errors = fetch_metrics_for_symbol(sym)
-            all_metrics.extend(metrics)
+            fetched, errors = fetch_metrics_for_symbol(sym)
+            all_metrics.extend(fetched)
             all_errors.extend(errors)
 
         progress.empty()
 
         if all_metrics:
-            with st.spinner("Saving to database..."):
-                inserted, updated, db_errors = upsert_stock_metrics(all_metrics)
-                all_errors.extend(db_errors)
-                clear_query_caches()
+            # Organize metrics into {symbol: {metric_name: {latest row data}}}
+            organized: dict[str, dict[str, dict]] = {}
+            # Also store raw history per symbol+metric for detail views
+            raw_history: dict[str, list[dict]] = st.session_state.get("metrics_raw_history", {})
+
+            for m in all_metrics:
+                sym = m.symbol
+                name = m.metric_name
+                row = {
+                    "metric_value": float(m.metric_value),
+                    "period_end": str(m.period_end),
+                    "period_start": str(m.period_start) if m.period_start else None,
+                    "fiscal_period": m.fiscal_period,
+                    "fiscal_year": m.fiscal_year,
+                    "filing_type": m.filing_type,
+                    "duration_days": m.duration_days,
+                    "reporting_style": m.reporting_style,
+                    "cik": m.cik,
+                    "source": m.source,
+                }
+
+                # Accumulate history
+                history_key = f"{sym}:{name}"
+                raw_history.setdefault(history_key, []).append(row)
+
+                # Keep latest by period_end
+                if sym not in organized:
+                    organized[sym] = {}
+                existing = organized[sym].get(name)
+                if existing is None or str(row["period_end"]) > str(existing["period_end"]):
+                    organized[sym][name] = row
+
+            st.session_state["metrics_data"] = organized
+            st.session_state["metrics_raw_history"] = raw_history
+            metrics_data = organized
 
             st.success(
-                f"Done: {inserted} new metrics inserted, {updated} updated "
-                f"across {len(fetch_symbols)} symbols."
+                f"Done: {len(all_metrics)} metrics fetched across {len(fetch_symbols)} symbols."
             )
         else:
             st.warning("No metrics were fetched. Check the issues below.")
@@ -131,27 +116,23 @@ with st.expander("Fetch from SEC EDGAR", expanded=not has_data):
 # ── Guard: need data to continue ────────────────────────────────────────────
 
 if not metrics_data:
-    st.info(
-        "No metrics in database yet. Use the **Fetch Metrics** section above "
-        "to pull fundamental data from SEC EDGAR."
-    )
-    st.stop()
-
-# Reload after potential fetch
-metrics_data = get_metrics_for_symbols(symbols)
-if not metrics_data:
+    st.info("No metrics fetched yet. Use the **Fetch Metrics** section above.")
     st.stop()
 
 # ── Pre-compute split detection per symbol ──────────────────────────────────
 
 _splits_cache: dict[str, list] = {}
+raw_history = st.session_state.get("metrics_raw_history", {})
+
+
+def _get_history(sym: str, metric_name: str) -> list[dict]:
+    return raw_history.get(f"{sym}:{metric_name}", [])
 
 
 def _get_splits_for_symbol(sym: str) -> list:
-    """Detect splits for a symbol, cached for the page render."""
     if sym not in _splits_cache:
-        shares = get_stock_metrics(symbol=sym, metric_name="shares_outstanding")
-        eps = get_stock_metrics(symbol=sym, metric_name="eps_diluted")
+        shares = _get_history(sym, "shares_outstanding")
+        eps = _get_history(sym, "eps_diluted")
         _splits_cache[sym] = detect_splits(shares, eps)
     return _splits_cache[sym]
 
@@ -173,6 +154,7 @@ DISPLAY_METRICS = [
 rows = []
 split_notes: list[str] = []
 ttm_notes: list[str] = []
+
 for sym in sorted(metrics_data.keys()):
     sym_metrics = metrics_data[sym]
     sym_splits = _get_splits_for_symbol(sym)
@@ -181,15 +163,14 @@ for sym in sorted(metrics_data.keys()):
     for metric_key, display_name, fmt in DISPLAY_METRICS:
         if metric_key in sym_metrics:
             raw_val = sym_metrics[metric_key].get("metric_value")
-            period = sym_metrics[metric_key].get("period_end", "")
-            filing = sym_metrics[metric_key].get("filing_type", "")
             fp = sym_metrics[metric_key].get("fiscal_period", "")
+            period = sym_metrics[metric_key].get("period_end", "")
             if raw_val is not None:
                 try:
                     val = float(raw_val)
 
                     if is_flow_metric(metric_key) and fp:
-                        history = get_stock_metrics(symbol=sym, metric_name=metric_key)
+                        history = _get_history(sym, metric_key)
                         history = normalize_metrics(history, sym_splits, metric_key)
                         vk = "normalized_value" if sym_splits else "metric_value"
 
@@ -213,14 +194,13 @@ for sym in sorted(metrics_data.keys()):
                                 ttm_notes.append(f"{sym}: TTM (annual) from {fp} data")
 
                         if sym_splits and sym not in [n.split(":")[0] for n in split_notes]:
-                            split_notes.append(f"{sym}: {len(sym_splits)} split(s) detected — per-share metrics adjusted")
+                            split_notes.append(f"{sym}: {len(sym_splits)} split(s) detected")
                     elif sym_splits and metric_key in (SPLIT_AFFECTED_PER_SHARE | SPLIT_AFFECTED_SHARE_COUNT):
                         val, was_adjusted = normalize_latest_value(
                             metric_key, val, str(period), sym_splits,
                         )
-                        if was_adjusted:
-                            if sym not in [n.split(":")[0] for n in split_notes]:
-                                split_notes.append(f"{sym}: {len(sym_splits)} split(s) detected — per-share metrics adjusted")
+                        if was_adjusted and sym not in [n.split(":")[0] for n in split_notes]:
+                            split_notes.append(f"{sym}: {len(sym_splits)} split(s) detected")
 
                     row[display_name] = val
                 except (ValueError, TypeError):
@@ -237,21 +217,18 @@ for sym in sorted(metrics_data.keys()):
     rows.append(row)
 
 
-# ── Main content: three tabs ─────────────────────────────────────────────────
+# ── Main content: three tabs ────────────────────────────────────────────────
 
 tab_overview, tab_heatmap, tab_detail = st.tabs(
     ["Portfolio Fundamentals", "Comparison Heatmap", "Symbol Detail"]
 )
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 1: Portfolio Fundamentals
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══ TAB 1: Portfolio Fundamentals ══════════════════════════════════════════
 
 with tab_overview:
     if rows:
         summary_df = pd.DataFrame(rows)
 
-        # ── Top KPI cards: aggregated portfolio-level numbers ────────────
         total_revenue = summary_df["Revenue"].sum()
         total_net_income = summary_df["Net Income"].sum()
         total_equity = summary_df["Equity"].sum()
@@ -272,10 +249,7 @@ with tab_overview:
 
         st.markdown("---")
 
-        # ── Color-coded summary table ────────────────────────────────────
-
         def _color_pnl(val):
-            """Color positive values green, negative red."""
             if pd.isna(val):
                 return ""
             try:
@@ -295,15 +269,7 @@ with tab_overview:
         }
 
         _style_subset = [c for c in colored_cols if c in summary_df.columns]
-        try:
-            styled = summary_df.style.map(
-                _color_pnl, subset=_style_subset
-            )
-        except AttributeError:
-            # pandas < 2.1 fallback
-            styled = summary_df.style.applymap(
-                _color_pnl, subset=_style_subset
-            )
+        styled = summary_df.style.map(_color_pnl, subset=_style_subset)
         st.dataframe(
             styled,
             use_container_width=True,
@@ -323,15 +289,12 @@ with tab_overview:
         st.info("No metrics to display.")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 2: Comparison Heatmap
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══ TAB 2: Comparison Heatmap ══════════════════════════════════════════════
 
 with tab_heatmap:
     if rows:
         heatmap_df = pd.DataFrame(rows).set_index("Symbol")
 
-        # Select numeric columns that have meaningful variance for comparison
         heatmap_metrics = ["Revenue", "Net Income", "EPS (Diluted)", "Equity",
                            "Operating Income", "Cash"]
         available_hm = [c for c in heatmap_metrics if c in heatmap_df.columns]
@@ -340,12 +303,11 @@ with tab_heatmap:
             st.subheader("Fundamentals Comparison")
             st.caption(
                 "Each cell shows a z-score: how many standard deviations above/below "
-                "the portfolio average. Green = above average, red = below."
+                "the average. Green = above average, red = below."
             )
 
             hm_data = heatmap_df[available_hm].apply(pd.to_numeric, errors="coerce")
 
-            # Z-score normalization (per column)
             means = hm_data.mean()
             stds = hm_data.std().replace(0, 1)
             z_scores = (hm_data - means) / stds
@@ -373,11 +335,7 @@ with tab_heatmap:
                         "<extra></extra>"
                     ),
                     showscale=True,
-                    colorbar=dict(
-                        title="Z-Score",
-                        thickness=12,
-                        len=0.6,
-                    ),
+                    colorbar=dict(title="Z-Score", thickness=12, len=0.6),
                 )
             )
             fig.update_layout(
@@ -388,20 +346,12 @@ with tab_heatmap:
             )
             st.plotly_chart(fig, use_container_width=True)
 
-            # ── Bar chart: compare a single metric across symbols ────────
             st.markdown("---")
             st.subheader("Compare Metric Across Symbols")
-            compare_metric = st.selectbox(
-                "Select metric",
-                options=available_hm,
-                index=0,
-                key="compare_metric",
-            )
+            compare_metric = st.selectbox("Select metric", options=available_hm, index=0, key="compare_metric")
 
             if compare_metric:
-                bar_data = hm_data[[compare_metric]].dropna().sort_values(
-                    compare_metric, ascending=True
-                )
+                bar_data = hm_data[[compare_metric]].dropna().sort_values(compare_metric, ascending=True)
                 colors = [
                     COLORS["profit"] if v >= 0 else COLORS["loss"]
                     for v in bar_data[compare_metric]
@@ -428,31 +378,22 @@ with tab_heatmap:
         st.info("No metrics data available for comparison.")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 3: Symbol Detail
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══ TAB 3: Symbol Detail ══════════════════════════════════════════════════
 
 with tab_detail:
     symbols_with_data = sorted(metrics_data.keys())
     if not symbols_with_data:
         st.stop()
 
-    detail_symbol = st.selectbox(
-        "Select symbol",
-        options=symbols_with_data,
-        key="detail_symbol",
-    )
+    detail_symbol = st.selectbox("Select symbol", options=symbols_with_data, key="detail_symbol")
 
     if detail_symbol:
-        latest = get_latest_stock_metrics(detail_symbol)
-
+        latest = metrics_data.get(detail_symbol, {})
         if not latest:
-            st.info(f"No metrics stored for {detail_symbol}.")
+            st.info(f"No metrics for {detail_symbol}.")
         else:
-            # ── Split detection ──────────────────────────────────────────
             detected_splits = _get_splits_for_symbol(detail_symbol)
 
-            # ── Styled KPI cards ─────────────────────────────────────────
             card_metrics = [
                 ("revenue", "Revenue"),
                 ("net_income", "Net Income"),
@@ -464,14 +405,13 @@ with tab_detail:
             for col, (key, label) in zip(cols, card_metrics):
                 if key in latest:
                     raw = latest[key].get("metric_value")
-                    period = latest[key].get("period_end", "")
                     fp = latest[key].get("fiscal_period", "")
                     try:
                         val = float(raw)
                         suffixes = []
 
                         if is_flow_metric(key) and fp:
-                            history = get_stock_metrics(symbol=detail_symbol, metric_name=key)
+                            history = _get_history(detail_symbol, key)
                             history = normalize_metrics(history, detected_splits, key)
                             vk = "normalized_value" if detected_splits else "metric_value"
 
@@ -495,6 +435,7 @@ with tab_detail:
                             if detected_splits:
                                 suffixes.append("adj")
                         elif detected_splits and key in (SPLIT_AFFECTED_PER_SHARE | SPLIT_AFFECTED_SHARE_COUNT):
+                            period = latest[key].get("period_end", "")
                             val, was_adj = normalize_latest_value(key, val, str(period), detected_splits)
                             if was_adj:
                                 suffixes.append("adj")
@@ -503,12 +444,7 @@ with tab_detail:
                         if suffixes:
                             adjusted_label = f"{label} ({', '.join(suffixes)})"
 
-                        if key.startswith("eps"):
-                            display = f"${val:,.2f}"
-                        else:
-                            display = f"${val:,.0f}"
-
-                        # Show delta color based on positive/negative
+                        display = f"${val:,.2f}" if key.startswith("eps") else f"${val:,.0f}"
                         delta_color = "normal" if val >= 0 else "inverse"
                         col.metric(
                             adjusted_label,
@@ -524,34 +460,19 @@ with tab_detail:
             if detected_splits:
                 with st.expander(f"Detected splits ({len(detected_splits)})", expanded=True):
                     for sp in detected_splits:
-                        icon = "🔴" if sp.confidence == "high" else "🟡"
                         st.markdown(
-                            f"{icon} **{sp.period_end}** — "
-                            f"ratio {sp.shares_ratio:.2f}x "
-                            f"({sp.confidence} confidence)"
+                            f"**{sp.period_end}** — ratio {sp.shares_ratio:.2f}x ({sp.confidence} confidence)"
                         )
                         st.caption(sp.reason)
 
-            # ── Historical data: tabbed view ─────────────────────────────
+            # Historical data
             st.markdown("---")
             st.subheader("Historical Metrics")
 
-            hist_metric = st.selectbox(
-                "Metric",
-                options=sorted(latest.keys()),
-                key="hist_metric",
-            )
-
-            show_raw = False
-            if detected_splits:
-                show_raw = st.checkbox(
-                    "Show raw (unadjusted) values",
-                    value=False,
-                    help="Uncheck to see split-adjusted values (default)",
-                )
+            hist_metric = st.selectbox("Metric", options=sorted(latest.keys()), key="hist_metric")
 
             if hist_metric:
-                history = get_stock_metrics(symbol=detail_symbol, metric_name=hist_metric)
+                history = _get_history(detail_symbol, hist_metric)
                 if history:
                     history.sort(key=lambda r: str(r.get("period_end", "")))
                     history = normalize_metrics(history, detected_splits, hist_metric)
@@ -562,28 +483,17 @@ with tab_detail:
                         try:
                             ttm_history = compute_ttm(history, value_key=ttm_value_key)
                         except TypeError:
-                            st.error(
-                                f"TTM computation failed for {hist_metric}. "
-                                "This may indicate a version mismatch — try restarting the app."
-                            )
                             ttm_history = []
-                        ttm_by_pe = {
-                            str(r.get("period_end", "")): r for r in ttm_history
-                        }
+                        ttm_by_pe = {str(r.get("period_end", "")): r for r in ttm_history}
                         for orig in history:
                             pe = str(orig.get("period_end", ""))
                             ttm_row = ttm_by_pe.get(pe, {})
-                            orig["quarterly_value"] = ttm_row.get("quarterly_value")
                             orig["ttm_value"] = ttm_row.get("ttm_value")
-                            orig["ttm_method"] = ttm_row.get("ttm_method")
-                            orig["is_ytd"] = ttm_row.get("is_ytd", False)
-                            if not orig.get("fiscal_period"):
-                                orig["fiscal_period"] = ttm_row.get("fiscal_period", "")
                         has_ttm = any(r.get("ttm_value") is not None for r in history)
 
                     if has_ttm:
                         value_col = "ttm_value"
-                    elif detected_splits and not show_raw:
+                    elif detected_splits:
                         value_col = "normalized_value"
                     else:
                         value_col = "metric_value"
@@ -593,37 +503,24 @@ with tab_detail:
                     hist_df[value_col] = pd.to_numeric(hist_df[value_col], errors="coerce")
                     hist_df = hist_df.sort_values("period_end")
 
-                    # ── Sub-tabs: Chart / Data Table ─────────────────────
                     sub_chart, sub_table = st.tabs(["Trend Chart", "Data Table"])
 
                     with sub_chart:
-                        if has_ttm:
-                            st.caption(
-                                "Showing TTM (trailing twelve months) values for "
-                                "apples-to-apples comparison across 10-K and 10-Q filings"
-                            )
-
                         chart_df = hist_df.dropna(subset=[value_col])
                         if not chart_df.empty:
-                            # Color by positive/negative values
                             y_vals = chart_df[value_col].tolist()
                             bar_colors = [
                                 COLORS["profit"] if v >= 0 else COLORS["loss"]
                                 for v in y_vals
                             ]
 
-                            # Use bars for quarterly data, line for longer series
                             if len(chart_df) <= 20:
                                 fig = go.Figure(
                                     go.Bar(
                                         x=chart_df["period_end"],
                                         y=chart_df[value_col],
                                         marker_color=bar_colors,
-                                        hovertemplate=(
-                                            "<b>%{x|%Y-%m-%d}</b><br>"
-                                            "Value: %{y:$,.0f}"
-                                            "<extra></extra>"
-                                        ),
+                                        hovertemplate="<b>%{x|%Y-%m-%d}</b><br>Value: %{y:$,.0f}<extra></extra>",
                                     )
                                 )
                             else:
@@ -634,22 +531,11 @@ with tab_detail:
                                         mode="lines+markers",
                                         line=dict(color=COLORS["primary"], width=2),
                                         marker=dict(size=5),
-                                        hovertemplate=(
-                                            "<b>%{x|%Y-%m-%d}</b><br>"
-                                            "Value: %{y:$,.0f}"
-                                            "<extra></extra>"
-                                        ),
+                                        hovertemplate="<b>%{x|%Y-%m-%d}</b><br>Value: %{y:$,.0f}<extra></extra>",
                                     )
                                 )
 
-                            # Add zero reference line
-                            fig.add_hline(
-                                y=0,
-                                line_dash="dot",
-                                line_color="#94a3b8",
-                                line_width=1,
-                            )
-
+                            fig.add_hline(y=0, line_dash="dot", line_color="#94a3b8", line_width=1)
                             fig.update_layout(
                                 height=400,
                                 yaxis_tickformat="$,.0f",
@@ -662,37 +548,14 @@ with tab_detail:
                             st.info("No numeric data to chart.")
 
                     with sub_table:
-                        display_cols = [
-                            "period_end", "fiscal_period", "fiscal_year",
-                            "filing_type", "metric_value", "duration_days",
-                            "reporting_style",
-                        ]
+                        display_cols = ["period_end", "fiscal_period", "fiscal_year",
+                                        "filing_type", "metric_value", "duration_days",
+                                        "reporting_style"]
                         if has_ttm:
-                            display_cols.extend([
-                                "quarterly_value", "ttm_value",
-                                "ttm_method", "is_ytd",
-                            ])
+                            display_cols.append("ttm_value")
                         if detected_splits:
                             display_cols.extend(["normalized_value", "split_adjusted"])
-                        if not has_ttm and not detected_splits:
-                            display_cols.append("source")
-
                         available = [c for c in display_cols if c in hist_df.columns]
-                        st.dataframe(
-                            hist_df[available].reset_index(drop=True),
-                            use_container_width=True,
-                            hide_index=True,
-                        )
+                        st.dataframe(hist_df[available].reset_index(drop=True), use_container_width=True, hide_index=True)
                 else:
                     st.info(f"No historical data for {hist_metric}.")
-
-        # Debug info (fully collapsed)
-        with st.expander("Debug: raw metric data"):
-            for name, row in sorted(latest.items()):
-                st.text(
-                    f"{name}: value={row.get('metric_value')}  "
-                    f"period={row.get('period_end')}  "
-                    f"filing={row.get('filing_type')}  "
-                    f"cik={row.get('cik')}  "
-                    f"fetched={row.get('fetched_at')}"
-                )

@@ -1,7 +1,6 @@
-"""Technical Analysis — signal-based ranking of portfolio holdings."""
+"""Technical Analysis — signal-based ranking of symbols."""
 
 import sys
-from datetime import date, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -9,7 +8,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pandas as pd
 import streamlit as st
 
-from src.db import get_account_ids, get_daily_prices, get_portfolio_symbols
 from src.technical import (
     SIGNAL_CATEGORIES,
     SIGNAL_LABELS,
@@ -19,37 +17,39 @@ from src.technical import (
     compute_signals,
     score_signals,
 )
+from src.ui_helpers import color_score
 
 st.title("Technical Analysis")
 
-# ── Account selector ─────────────────────────────────────────────────────────
+# ── Guard: need symbols + prices ────────────────────────────────────────────
 
-account_ids = get_account_ids()
-if not account_ids:
-    st.info("No statements uploaded yet.")
-    st.page_link("pages/1_Upload.py", label="Go to Upload", icon="📤")
-    st.stop()
-
-with st.sidebar:
-    account_options = ["All Accounts"] + account_ids
-    selected_account = st.selectbox("Account", account_options)
-    account_filter = None if selected_account == "All Accounts" else selected_account
-
-symbols = get_portfolio_symbols(account_id=account_filter)
+symbols = st.session_state.get("symbols", [])
 if not symbols:
-    st.info("No stock/ETF positions found.")
-    st.page_link("pages/1_Upload.py", label="Upload a statement with holdings", icon="📤")
+    st.info("No symbols configured. Go to the main page and enter ticker symbols.")
     st.stop()
 
-# ── Controls ─────────────────────────────────────────────────────────────────
+all_price_data: dict[str, pd.DataFrame] = st.session_state.get("price_data", {})
+if not all_price_data:
+    st.warning("No price data available. Fetch daily prices first.")
+    st.page_link("pages/2_Prices.py", label="Go to Prices", icon="📈")
+    st.stop()
 
-col_preset, col_lookback, col_info = st.columns([1, 1, 2])
+# Filter to only symbols that have price data
+price_data = {sym: all_price_data[sym] for sym in symbols if sym in all_price_data}
+if not price_data:
+    st.warning("No price data for your symbols. Fetch prices first.")
+    st.page_link("pages/2_Prices.py", label="Go to Prices", icon="📈")
+    st.stop()
+
+# ── Controls ────────────────────────────────────────────────────────────────
+
+col_preset, col_info = st.columns([1, 2])
 
 with col_preset:
     preset = st.selectbox(
         "Strategy Preset",
         options=list(WEIGHT_PRESETS.keys()),
-        index=1,  # default to Balanced
+        index=1,
         help=(
             "**Momentum**: Overweights trend & momentum signals. "
             "**Balanced**: Equal category weighting. "
@@ -57,21 +57,11 @@ with col_preset:
         ),
     )
 
-with col_lookback:
-    lookback_days = st.number_input(
-        "Lookback (days)",
-        min_value=60,
-        max_value=500,
-        value=365,
-        step=30,
-        help="How many days of price history to use. 252+ needed for 12-1mo momentum.",
-    )
-
 with col_info:
-    st.markdown("")  # spacer
-    st.caption(f"{len(symbols)} symbols · Preset: **{preset}** · {lookback_days}d lookback")
+    st.markdown("")
+    st.caption(f"{len(price_data)} symbols with price data · Preset: **{preset}**")
 
-# ── Weight display ───────────────────────────────────────────────────────────
+# ── Weight display ──────────────────────────────────────────────────────────
 
 with st.expander("View preset weights"):
     weights = WEIGHT_PRESETS[preset]
@@ -83,7 +73,6 @@ with st.expander("View preset weights"):
             "Weight": f"{w:.0%}",
         })
     wdf = pd.DataFrame(weight_rows)
-    # Group by category for summary
     cat_totals = {}
     for key, w in weights.items():
         cat = SIGNAL_CATEGORIES[key]
@@ -92,30 +81,7 @@ with st.expander("View preset weights"):
     st.caption(cat_summary)
     st.dataframe(wdf, use_container_width=True, hide_index=True)
 
-# ── Load price data ──────────────────────────────────────────────────────────
-
-start_date = date.today() - timedelta(days=lookback_days)
-
-price_data: dict[str, pd.DataFrame] = {}
-missing_symbols: list[str] = []
-
-for sym in symbols:
-    rows = get_daily_prices(sym, date_from=start_date)
-    if rows:
-        price_data[sym] = pd.DataFrame(rows)
-    else:
-        missing_symbols.append(sym)
-
-if missing_symbols:
-    st.warning(f"No price data for: {', '.join(missing_symbols)}.")
-    st.page_link("pages/6_Prices.py", label="Fetch prices", icon="📈")
-
-if not price_data:
-    st.info("No price data available. Fetch daily prices first.")
-    st.page_link("pages/6_Prices.py", label="Go to Prices", icon="📈")
-    st.stop()
-
-# ── Compute rankings ─────────────────────────────────────────────────────────
+# ── Compute rankings ────────────────────────────────────────────────────────
 
 rankings_df = compute_all_rankings(price_data, preset=preset)
 
@@ -123,11 +89,10 @@ if rankings_df.empty:
     st.warning("Not enough price history to compute signals. Need at least 15 trading days.")
     st.stop()
 
-# ── Composite ranking table ──────────────────────────────────────────────────
+# ── Composite ranking table ─────────────────────────────────────────────────
 
 st.subheader("Composite Ranking")
 
-# Build display table with scores and MA flags
 display_cols = ["Rank", "Symbol", "Composite"]
 ma_flag_cols = ["above_sma50", "above_sma100", "above_sma200"]
 for col in ma_flag_cols:
@@ -138,20 +103,15 @@ for key in SIGNAL_LABELS:
 
 display_df = rankings_df[display_cols].copy()
 rename_map = {f"{k}_score": SIGNAL_LABELS[k] for k in SIGNAL_LABELS}
-# Convert MA flags to visual indicators
 ma_rename = {}
 for col in ma_flag_cols:
     if col in display_df.columns:
         period = col.replace("above_sma", "")
         label = f"SMA {period}"
-        display_df[col] = display_df[col].map(
-            {True: "\u2705", False: "\u274c", None: "\u2014"}
-        )
+        display_df[col] = display_df[col].map({True: "\u2705", False: "\u274c", None: "\u2014"})
         ma_rename[col] = label
 rename_map.update(ma_rename)
 display_df = display_df.rename(columns=rename_map)
-
-from src.ui_helpers import color_score
 
 score_columns = ["Composite"] + list(SIGNAL_LABELS.values())
 styled = display_df.style.map(color_score, subset=score_columns)
@@ -167,11 +127,11 @@ st.dataframe(
 )
 
 st.caption(
-    "Scores: 0–100 (higher = more favorable). "
+    "Scores: 0-100 (higher = more favorable). "
     "RSI and Bollinger %B use contrarian scoring — oversold = opportunity."
 )
 
-# ── Per-symbol detail ────────────────────────────────────────────────────────
+# ── Per-symbol detail ───────────────────────────────────────────────────────
 
 st.divider()
 st.subheader("Signal Detail")
@@ -199,7 +159,7 @@ if detail_symbol and detail_symbol in price_data:
         else:
             col.metric(f"SMA {period}", "\u2014 N/A")
 
-    # Signal cards in two rows
+    # Signal cards
     signal_keys = list(SIGNAL_LABELS.keys())
     row1_keys = signal_keys[:5]
     row2_keys = signal_keys[5:]
@@ -209,7 +169,6 @@ if detail_symbol and detail_symbol in price_data:
         raw_val = raw.get(key)
         score_val = scores.get(key)
         if raw_val is not None:
-            # Format raw value
             if key == "rsi_14":
                 raw_display = f"{raw_val:.1f}"
             elif key in ("momentum_12_1", "roc_20", "realized_vol_20", "atr_pct", "sma_trend"):
